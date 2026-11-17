@@ -37,6 +37,15 @@ NIXL needs `nixl==1.5.0` and `nixl-cu13==1.5.0` (installed by
 transports with the usual UCX variables, e.g. `UCX_NET_DEVICES`, `UCX_TLS` and
 `UCX_MAX_RMA_RAILS`.
 
+The read path requires PyTorch's batched transport API
+([pytorch/pytorch#205093](https://github.com/pytorch/pytorch/pull/205093)).
+With native NIXL batching
+([pytorch/pytorch#205182](https://github.com/pytorch/pytorch/pull/205182)),
+all planned ranges for one trainer and pair of memory types share one request.
+For example, 256 ranges from two trainers use two NIXL requests, instead of 256.
+Other backends use the transport API's per-range implementation. Staging and
+the byte ranges do not change.
+
 ## Layout
 
 Every generator has the same sharding, so each trainer rank stages one copy of
@@ -88,8 +97,10 @@ does not cover every element of a generator shard, or on `Partial` and uneven
    runs on the actor thread before the push's first `await`. The controller
    sends the push before the next forward/backward and Monarch starts them in
    that order, so every rank issues it before its training collectives.
-3. Pull: each generator rank issues its reads (`read`) and waits for them,
-   raising after `read_timeout_s` (600 s). A timeout leaves the reads in flight;
+3. Pull: each generator rank submits its planned ranges as one async batch
+   (`read_batch_async`) and waits for all of them. `read_timeout_s` (600 s)
+   covers submission and completion waiting; synchronous native submission
+   cannot be interrupted. A timeout leaves the reads in flight;
    restart the job.
 
 The controller finishes pull N before push N+1, so a single staging buffer is

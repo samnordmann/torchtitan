@@ -12,7 +12,6 @@ See ``MODEL_STATE_DICT_TRANSPORT.md``.
 
 from __future__ import annotations
 
-import asyncio
 import itertools
 import math
 import weakref
@@ -25,7 +24,7 @@ import torch
 # torch.distributed.tensor._utils and placement_types._StridedShard are private
 # upstream APIs; switch to public ones once they exist (no upstream issue yet).
 import torch.cuda._pin_memory_utils as pin_memory_utils
-from torch.distributed._transport import new_transport, wait_all
+from torch.distributed._transport import new_transport
 from torch.distributed.tensor import DTensor, Partial, Placement, Shard
 from torch.distributed.tensor._utils import (
     _compute_local_shape_and_global_offset,
@@ -537,10 +536,6 @@ class ModelStateDictTransport(Configurable):
         assert self._reads is not None, "connect_generator must be called first"
         if not self._reads:
             return
-        works = await asyncio.to_thread(
-            lambda: [
-                self._transport.read(local, remote, async_op=True)
-                for local, remote in self._reads
-            ]
+        await self._transport.read_batch_async(
+            self._reads, timeout=self._read_timeout_s
         )
-        await wait_all(works, timeout=self._read_timeout_s)

@@ -10,7 +10,7 @@ FSDP/HSDP and generator TP shardings, over an in-process fake transport."""
 
 import asyncio
 import itertools
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import torch
@@ -68,14 +68,13 @@ class _FakeTransport:
     def connect(self, url):
         self.connected.add(url)
 
-    def read(self, local, remote, *, async_op):
-        assert remote.url in self.connected
-        assert local.shape == remote.data.shape
-        local.copy_(remote.data)
-
-
-async def _wait_all(works, *, timeout):
-    pass
+    async def read_batch_async(self, transfers, *, timeout):
+        assert transfers, "empty plans must not dispatch"
+        assert timeout > 0
+        for local, remote in transfers:
+            assert remote.url in self.connected
+            assert local.shape == remote.data.shape
+            local.copy_(remote.data)
 
 
 def _boxes(shape, num_shards, dim):
@@ -118,11 +117,7 @@ def _transfer(
         assert backend == config.backend
         return _FakeTransport()
 
-    async def wait_all(works, *, timeout):
-        assert timeout == config.read_timeout_s
-
     monkeypatch.setattr(m, "new_transport", new_transport)
-    monkeypatch.setattr(m, "wait_all", wait_all)
 
     generator_sds = []
     for shards in generator_shards:
@@ -302,6 +297,24 @@ def test_no_reads(monkeypatch):
     assert out["w"].shape == (0, 3)
 
 
+@pytest.mark.parametrize(
+    "error", [None, RuntimeError, TimeoutError, asyncio.CancelledError]
+)
+def test_read_awaits_one_batch(monkeypatch, error):
+    transport = _FakeTransport()
+    transport.read_batch_async = AsyncMock(side_effect=error)
+    monkeypatch.setattr(m, "new_transport", lambda backend: transport)
+    generator = ModelStateDictTransport.Config(read_timeout_s=7.5).build()
+    pairs = [(object(), object()), (object(), object())]
+    generator._reads = pairs
+    if error is None:
+        asyncio.run(generator.read())
+    else:
+        with pytest.raises(error):
+            asyncio.run(generator.read())
+    transport.read_batch_async.assert_awaited_once_with(pairs, timeout=7.5)
+
+
 def test_shared_rank_layouts():
     a = m.TensorShard((0,), (2,), torch.float32)
     b = m.TensorShard((2,), (2,), torch.float32)
@@ -389,7 +402,6 @@ class TestStageDTensors(DTensorTestBase):
         global_offset_and_local_shape = m._global_offset_and_local_shape
         with (
             patch.object(m, "new_transport", lambda backend: _FakeTransport()),
-            patch.object(m, "wait_all", _wait_all),
             patch.object(
                 m,
                 "_global_offset_and_local_shape",
